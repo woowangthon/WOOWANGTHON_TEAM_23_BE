@@ -1,0 +1,9 @@
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+.env*
+!.env.example
+
+.DS_Store
+.vscode/
+.idea/
