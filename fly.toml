@@ -1,0 +1,33 @@
+# fly.toml app configuration file generated for scrollmate-be on 2026-11-11T15:05:27+09:00
+#
+# See https://docs.fly.io/reference/configuration for information about how to use this file.
+#
+
+app = 'scrollmate-be'
+primary_region = 'nrt'
+
+[build]
+[env]
+  OPENAI_MODEL = 'gpt-5.4-mini'
+
+[[mounts]]
+  source = 'be_data'
+  destination = '/data'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '20s'
+    method = 'GET'
+    path = '/api/v1/health'
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '512mb'
