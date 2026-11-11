@@ -175,4 +175,8 @@ def test_delete_answers_review_grade_report(env):
 
     assert client.delete(f"/api/v1/materials/{material_id}", headers=H).status_code == 204
     assert client.get("/api/v1/questions", headers=H).json()["questions"] == []
+    # 자료와 함께 풀이 결과·신고도 지워짐
+    db = client.app.state.db
+    assert db.conn.execute("SELECT COUNT(*) FROM answers").fetchone()[0] == 0
+    assert db.conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0] == 0
     assert client.delete(f"/api/v1/materials/{material_id}", headers=H).json()["error"]["code"] == "not_found"
