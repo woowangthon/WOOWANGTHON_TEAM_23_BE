@@ -11,7 +11,7 @@ uv sync
 AI_URL=http://localhost:8001/internal/v1 uv run uvicorn --factory app.main:create_app --port 8080
 ```
 
-- `AI_URL`: AI 서비스 주소. 기본값은 위와 같음
+- `AI_URL`: AI 서비스 주소. 기본값은 위와 같음. AI는 `OPENAI_API_KEY`, `OPENAI_MODEL`이 있어야 호출됨(AI 레포 README)
 - `BE_DB_PATH`: SQLite 파일 위치. 기본값 `data/be.sqlite3`
 
 테스트는 AI 서비스 없이 돎 (AI 응답을 테스트 안에서 정해 둠).
@@ -19,6 +19,23 @@ AI_URL=http://localhost:8001/internal/v1 uv run uvicorn --factory app.main:creat
 ```bash
 uv run pytest
 ```
+
+## 배포 (Fly.io)
+
+BE와 AI 서비스를 한 컨테이너에서 프로세스 2개로 띄움. 외부에는 BE(8080)만 열리고 AI(8001)는 컨테이너 안에서만 접근함. 빌드 때 AI 레포 `main`을 받아 옴(`Dockerfile`의 `AI_REF`).
+
+- 주소: `https://scrollmate-be.fly.dev` (앱 `scrollmate-be`, 도쿄, 1대 512MB)
+- SQLite는 볼륨 `be_data`(`/data`)에 저장함. 볼륨을 지우면 자료와 문제도 사라짐
+- 모델은 `fly.toml`의 `OPENAI_MODEL`. 키는 저장소에 두지 않고 Fly 시크릿으로만 넣음
+
+```bash
+fly secrets set OPENAI_API_KEY=...
+fly deploy
+curl https://scrollmate-be.fly.dev/api/v1/health
+```
+
+- 자동 배포는 쓰지 않음. 배포는 직접 `fly deploy`로 함
+- 업로드한 자료의 글자는 OpenAI API로 전송됨
 
 ## 구조
 
