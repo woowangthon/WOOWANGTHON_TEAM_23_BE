@@ -168,6 +168,12 @@ def create_app(db_path: str | None = None, ai_url: str | None = None, run_worker
             if not conn.execute("SELECT 1 FROM materials WHERE id = ? AND device_id = ?", (material_id, device_id)).fetchone():
                 raise ApiError(404, "not_found", "없는 자료")
             conn.execute("BEGIN")
+            # 풀이 결과와 신고도 자료와 함께 지움. 문제가 사라지면 쓸 곳이 없고, 삭제 안내 문구와 맞추기 위함
+            for table in ("answers", "reports"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE question_id IN (SELECT id FROM questions WHERE material_id = ?)",
+                    (material_id,),
+                )
             for table in ("questions", "chunks", "pages"):
                 conn.execute(f"DELETE FROM {table} WHERE material_id = ?", (material_id,))
             conn.execute("DELETE FROM materials WHERE id = ?", (material_id,))
