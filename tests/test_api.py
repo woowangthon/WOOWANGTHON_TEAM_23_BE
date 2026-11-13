@@ -180,3 +180,45 @@ def test_delete_answers_review_grade_report(env):
     assert db.conn.execute("SELECT COUNT(*) FROM answers").fetchone()[0] == 0
     assert db.conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0] == 0
     assert client.delete(f"/api/v1/materials/{material_id}", headers=H).json()["error"]["code"] == "not_found"
+
+
+def test_abuse_limits(env, monkeypatch):
+    client, worker, _ = env
+    from app import main
+    data = make_pptx(SLIDES)
+
+    # 기기 ID를 바꿔도 같은 IP의 하루 업로드 한도에 걸림
+    monkeypatch.setattr(main, "IP_DAILY_UPLOADS", 2)
+    ip = {"Fly-Client-IP": "203.0.113.7"}
+    assert upload(client, [("a.pptx", data, PPTX)], headers={**ip, "X-Device-Id": "a"}).status_code == 202
+    assert upload(client, [("b.pptx", data, PPTX)], headers={**ip, "X-Device-Id": "b"}).status_code == 202
+    r = upload(client, [("c.pptx", data, PPTX)], headers={**ip, "X-Device-Id": "c"})
+    assert r.status_code == 429 and r.json()["error"]["code"] == "rate_limited"
+    drain(worker)
+
+
+def test_server_daily_chunk_limit(tmp_path, monkeypatch):
+    from app import main
+    monkeypatch.setattr(main, "DAILY_CHUNKS", 3)
+    app = create_app(str(tmp_path / "t.sqlite3"), "http://ai/internal/v1", run_worker=False)
+    with TestClient(app) as client:
+        data = make_pptx(SLIDES)  # 조각 2개
+        assert upload(client, [("a.pptx", data, PPTX)], headers={"X-Device-Id": "a"}).status_code == 202
+        r = upload(client, [("b.pptx", data, PPTX)], headers={"X-Device-Id": "b"})
+        assert r.status_code == 429 and r.json()["error"]["code"] == "rate_limited"
+        # 거절된 요청은 자료도 사용량도 남기지 않음
+        assert client.get("/api/v1/materials", headers={"X-Device-Id": "b"}).json()["materials"] == []
+
+
+def test_input_size_limits(env, monkeypatch):
+    client, _, _ = env
+    from app import extract
+    assert client.get("/docs").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
+    assert upload(client, [("a.pptx", make_pptx(SLIDES), PPTX)], headers={"X-Device-Id": "x" * 65}).status_code == 400
+    r = client.post("/api/v1/materials", headers={**H, "Content-Length": str(200 * 1024 * 1024)}, content=b"x")
+    assert r.status_code == 413
+    answers = [{"questionId": "q", "result": "wrong", "answeredAt": "t"}] * 201
+    assert client.post("/api/v1/answers", json={"answers": answers}, headers=H).status_code == 400
+    monkeypatch.setattr(extract, "MAX_UNZIPPED_BYTES", 1000)
+    assert upload(client, [("bomb.pptx", make_pptx(SLIDES), PPTX)]).status_code == 415

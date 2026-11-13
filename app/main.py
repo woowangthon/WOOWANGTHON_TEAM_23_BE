@@ -6,12 +6,13 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.db import Database
-from app.extract import UnsupportedFile, extract_pages, kind_of, split_chunks, squash
+from app.extract import TooManyPages, UnsupportedFile, extract_pages, kind_of, split_chunks, squash
 from app.worker import Worker
 
 KST = timezone(timedelta(hours=9))
@@ -22,6 +23,11 @@ MAX_PROCESSING = 5
 DAILY_UPLOADS = 10
 # 전체 대기 조각 상한. 조각당 약 4초라 이 정도면 대기가 1시간을 넘음
 MAX_PENDING_CHUNKS = 900
+# 로그인이 없어 기기 ID를 바꾸면 기기별 한도를 피할 수 있음. 서버 전체와 IP 기준 하루 한도로 OpenAI 비용을 묶음
+DAILY_CHUNKS = int(os.environ.get("BE_DAILY_CHUNKS", "2000"))
+IP_DAILY_UPLOADS = int(os.environ.get("BE_IP_DAILY_UPLOADS", "30"))
+MAX_BODY_BYTES = MAX_FILES * MAX_BYTES + 1024 * 1024
+MAX_DEVICE_ID = 64
 
 
 class ApiError(HTTPException):
@@ -50,7 +56,7 @@ def create_app(db_path: str | None = None, ai_url: str | None = None, run_worker
         yield
         worker.stop()
 
-    app = FastAPI(lifespan=lifespan)
+    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.db = db
     app.state.worker = worker
 
@@ -63,19 +69,29 @@ def create_app(db_path: str | None = None, ai_url: str | None = None, run_worker
     def validation_error(_, e: RequestValidationError):
         return JSONResponse({"error": {"code": "invalid_request", "message": str(e.errors())[:300]}}, status_code=400)
 
+    @app.middleware("http")
+    async def limit_body(request: Request, call_next):
+        # 파일별 20MB 검사는 본문을 다 받은 뒤라, 그 전에 전체 크기로 먼저 거름
+        length = request.headers.get("content-length")
+        if length and length.isdigit() and int(length) > MAX_BODY_BYTES:
+            return JSONResponse({"error": {"code": "file_too_large", "message": "요청 크기 초과"}}, status_code=413)
+        return await call_next(request)
+
     def device(x_device_id: str | None) -> str:
         if not x_device_id or not x_device_id.strip():
             raise ApiError(400, "invalid_request", "X-Device-Id 헤더 필요")
+        if len(x_device_id.strip()) > MAX_DEVICE_ID:
+            raise ApiError(400, "invalid_request", "X-Device-Id가 너무 김")
         return x_device_id.strip()
 
-    def use_quota(device_id: str, kind: str, amount: int, limit: int) -> None:
+    def use_quota(device_id: str, kind: str, amount: int, limit: int, message: str | None = None) -> None:
         conn = db.conn
         row = conn.execute(
             "SELECT count FROM usage_counts WHERE device_id = ? AND day = ? AND kind = ?", (device_id, today(), kind)
         ).fetchone()
         used = row["count"] if row else 0
         if used + amount > limit:
-            raise ApiError(429, "rate_limited", f"하루 한도 초과 ({kind} {limit})")
+            raise ApiError(429, "rate_limited", message or f"하루 한도 초과 ({kind} {limit})")
         conn.execute(
             "INSERT INTO usage_counts VALUES (?, ?, ?, ?) ON CONFLICT DO UPDATE SET count = count + excluded.count",
             (device_id, today(), kind, amount),
@@ -101,7 +117,7 @@ def create_app(db_path: str | None = None, ai_url: str | None = None, run_worker
         return row
 
     @app.post("/api/v1/materials", status_code=202)
-    async def upload(files: list[UploadFile] = File(...), x_device_id: str | None = Header(None)):
+    async def upload(request: Request, files: list[UploadFile] = File(...), x_device_id: str | None = Header(None)):
         device_id = device(x_device_id)
         if not 1 <= len(files) <= MAX_FILES:
             raise ApiError(400, "invalid_request", f"파일은 1~{MAX_FILES}개")
@@ -111,15 +127,16 @@ def create_app(db_path: str | None = None, ai_url: str | None = None, run_worker
             if len(data) > MAX_BYTES:
                 raise ApiError(413, "file_too_large", f"{f.filename}: 20MB 초과")
             try:
-                pages = extract_pages(kind_of(f.filename or "", f.content_type), data)
+                # 파싱이 오래 걸려도 다른 요청이 멈추지 않게 스레드에서 돌림
+                pages = await run_in_threadpool(extract_pages, kind_of(f.filename or "", f.content_type), data, MAX_PAGES)
+            except TooManyPages:
+                raise ApiError(413, "file_too_large", f"{f.filename}: {MAX_PAGES}쪽(슬라이드) 초과")
             except UnsupportedFile:
                 raise ApiError(415, "unsupported_file", f"{f.filename}: PDF·PPTX가 아니거나 열 수 없음")
-            if len(pages) > MAX_PAGES:
-                raise ApiError(413, "file_too_large", f"{f.filename}: {MAX_PAGES}쪽(슬라이드) 초과")
             chunks = split_chunks(pages)
             if not chunks:
                 raise ApiError(415, "unsupported_file", f"{f.filename}: 글자를 뽑을 수 없음 (스캔본, 이미지 슬라이드)")
-            parsed.append((f.filename or "자료", pages, chunks))
+            parsed.append(((f.filename or "자료")[:200], pages, chunks))
 
         with db.lock:
             conn = db.conn
@@ -134,6 +151,11 @@ def create_app(db_path: str | None = None, ai_url: str | None = None, run_worker
             conn.execute("BEGIN")
             try:
                 use_quota(device_id, "upload", len(parsed), DAILY_UPLOADS)
+                # Fly 프록시가 붙이는 실제 접속 IP. 로컬 실행에는 없어서 건너뜀
+                ip = request.headers.get("fly-client-ip")
+                if ip:
+                    use_quota(f"ip:{ip}", "upload", len(parsed), IP_DAILY_UPLOADS)
+                use_quota("*", "chunks", sum(len(c) for _, _, c in parsed), DAILY_CHUNKS, "서버 하루 생성 한도 초과")
                 ids = []
                 for name, pages, chunks in parsed:
                     material_id = f"m_{uuid.uuid4().hex[:12]}"
@@ -196,7 +218,7 @@ def create_app(db_path: str | None = None, ai_url: str | None = None, run_worker
         return {"questions": [question_json(r) for r in rows], "serverTime": server_time.isoformat()}
 
     class GradeBody(BaseModel):
-        userAnswer: str
+        userAnswer: str = Field(max_length=100)
 
     # 단답은 명사 하나로만 출제하고 같은 대상의 다른 이름을 accepted에 미리 받아 두므로 글자 비교만 함
     @app.post("/api/v1/questions/{question_id}/grade")
@@ -210,12 +232,12 @@ def create_app(db_path: str | None = None, ai_url: str | None = None, run_worker
         return {"correct": squash(body.userAnswer).casefold() in answers, "by": "rule"}
 
     class Answer(BaseModel):
-        questionId: str
-        result: str
-        answeredAt: str
+        questionId: str = Field(max_length=40)
+        result: str = Field(max_length=10)
+        answeredAt: str = Field(max_length=40)
 
     class AnswersBody(BaseModel):
-        answers: list[Answer]
+        answers: list[Answer] = Field(max_length=200)
 
     @app.post("/api/v1/answers")
     def post_answers(body: AnswersBody, x_device_id: str | None = Header(None)):
@@ -246,7 +268,7 @@ def create_app(db_path: str | None = None, ai_url: str | None = None, run_worker
         ]}
 
     class ReportBody(BaseModel):
-        reason: str
+        reason: str = Field(max_length=200)
 
     @app.post("/api/v1/questions/{question_id}/report", status_code=204)
     def report(question_id: str, body: ReportBody, x_device_id: str | None = Header(None)):
