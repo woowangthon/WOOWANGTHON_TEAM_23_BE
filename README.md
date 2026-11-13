@@ -30,11 +30,11 @@ BE와 AI 서비스를 한 컨테이너에서 프로세스 2개로 띄움. 외부
 
 ```bash
 fly secrets set OPENAI_API_KEY=...
-fly deploy
+fly deploy --no-cache
 curl https://scrollmate-be.fly.dev/api/v1/health
 ```
 
-- 자동 배포는 쓰지 않음. 배포는 직접 `fly deploy`로 함
+- 자동 배포는 쓰지 않음. 배포는 직접 `fly deploy --no-cache`로 함. 캐시를 쓰면 AI 레포를 받는 단계가 재사용되어 AI의 새 커밋이 반영되지 않음(2026-11-13 확인)
 - 업로드한 자료의 글자는 OpenAI API로 전송됨
 
 ## 구조
