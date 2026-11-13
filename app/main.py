@@ -26,6 +26,9 @@ MAX_PENDING_CHUNKS = 900
 # 로그인이 없어 기기 ID를 바꾸면 기기별 한도를 피할 수 있음. 서버 전체와 IP 기준 하루 한도로 OpenAI 비용을 묶음
 DAILY_CHUNKS = int(os.environ.get("BE_DAILY_CHUNKS", "2000"))
 IP_DAILY_UPLOADS = int(os.environ.get("BE_IP_DAILY_UPLOADS", "30"))
+# 안 푼 문제가 자료마다 이 수보다 적어지면 새 문제를 채움. 자료 하나에 채우는 횟수는 상한을 둠
+FRESH_TARGET = 5
+MAX_REFILLS_PER_MATERIAL = 10
 MAX_BODY_BYTES = MAX_FILES * MAX_BYTES + 1024 * 1024
 MAX_DEVICE_ID = 64
 
@@ -109,6 +112,38 @@ def create_app(db_path: str | None = None, ai_url: str | None = None, run_worker
             "id": row["id"], "materialId": row["material_id"], "type": row["type"], "question": row["question"],
             "answer": row["answer"], "accepted": json.loads(row["accepted"]), "evidence": row["evidence"], "page": row["page"],
         }
+
+    def schedule_refills(device_id: str, question_ids: set[str]) -> None:
+        """풀이 기록이 들어온 자료마다 안 푼 문제가 모자라면 새 문제 만들기를 예약함. lock 안에서 부름"""
+        conn = db.conn
+        if not question_ids:
+            return
+        marks = ",".join("?" * len(question_ids))
+        material_ids = [r["material_id"] for r in conn.execute(
+            f"SELECT DISTINCT material_id FROM questions WHERE device_id = ? AND id IN ({marks})", (device_id, *question_ids)
+        )]
+        for material_id in material_ids:
+            material = conn.execute("SELECT * FROM materials WHERE id = ? AND status = 'ready'", (material_id,)).fetchone()
+            if material is None:
+                continue
+            fresh = conn.execute(
+                "SELECT COUNT(*) FROM questions q WHERE q.material_id = ? AND q.device_id = ? "
+                "AND NOT EXISTS (SELECT 1 FROM answers a WHERE a.question_id = q.id AND a.device_id = q.device_id)",
+                (material_id, device_id),
+            ).fetchone()[0]
+            pending = conn.execute("SELECT COUNT(*) FROM refills WHERE material_id = ? AND status = 'pending'", (material_id,)).fetchone()[0]
+            made = conn.execute("SELECT COUNT(*) FROM refills WHERE material_id = ?", (material_id,)).fetchone()[0]
+            if pending or fresh >= FRESH_TARGET or made >= MAX_REFILLS_PER_MATERIAL:
+                continue
+            try:
+                use_quota("*", "chunks", 1, DAILY_CHUNKS)
+            except ApiError:
+                continue
+            # 조각을 돌아가며 골라 자료의 여러 부분에서 문제가 나오게 함
+            conn.execute(
+                "INSERT INTO refills (material_id, chunk_idx) VALUES (?, ?)", (material_id, made % material["chunks_total"])
+            )
+            worker.wake.set()
 
     def owned_question(device_id: str, question_id: str):
         row = db.conn.execute("SELECT * FROM questions WHERE id = ? AND device_id = ?", (question_id, device_id)).fetchone()
@@ -196,7 +231,7 @@ def create_app(db_path: str | None = None, ai_url: str | None = None, run_worker
                     f"DELETE FROM {table} WHERE question_id IN (SELECT id FROM questions WHERE material_id = ?)",
                     (material_id,),
                 )
-            for table in ("questions", "chunks", "pages"):
+            for table in ("questions", "chunks", "pages", "refills"):
                 conn.execute(f"DELETE FROM {table} WHERE material_id = ?", (material_id,))
             conn.execute("DELETE FROM materials WHERE id = ?", (material_id,))
             conn.execute("COMMIT")
@@ -243,14 +278,23 @@ def create_app(db_path: str | None = None, ai_url: str | None = None, run_worker
     def post_answers(body: AnswersBody, x_device_id: str | None = Header(None)):
         device_id = device(x_device_id)
         recorded = 0
+        touched: set[str] = set()
         with db.lock:
             for a in body.answers:
                 if a.result not in ("correct", "wrong", "skipped"):
                     continue
                 if not db.conn.execute("SELECT 1 FROM questions WHERE id = ? AND device_id = ?", (a.questionId, device_id)).fetchone():
                     continue
+                # 앱이 기록을 다시 보내도 같은 기록이 쌓이지 않게 함
+                if db.conn.execute(
+                    "SELECT 1 FROM answers WHERE device_id = ? AND question_id = ? AND answered_at = ?",
+                    (device_id, a.questionId, a.answeredAt),
+                ).fetchone():
+                    continue
                 db.conn.execute("INSERT INTO answers VALUES (?, ?, ?, ?)", (device_id, a.questionId, a.result, a.answeredAt))
+                touched.add(a.questionId)
                 recorded += 1
+            schedule_refills(device_id, touched)
         return {"recorded": recorded}
 
     @app.get("/api/v1/review")

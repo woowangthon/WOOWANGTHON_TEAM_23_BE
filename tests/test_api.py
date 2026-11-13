@@ -62,6 +62,11 @@ class FakeAI:
         text = json["text"]
         sentence = "운전면허 학과시험은 40문항이며 합격 기준은 1종 70점, 2종 60점이다." if "학과시험" in text else \
             "도로교통법은 혈중알코올농도 0.03퍼센트 이상인 상태의 운전을 금지한다."
+        if json.get("avoid"):
+            # 채우기 요청에는 이미 낸 것과 다른 문제를 돌려줌
+            return worker_module.httpx.Response(200, json={"questions": [
+                {"type": "short", "question": "새로 만든 문제는 무엇인가?", "answer": "새답", "accepted": [], "evidence": sentence},
+            ], "provider": "openai", "discarded": 0}, request=request)
         return worker_module.httpx.Response(200, json={"questions": [
             {"type": "ox", "question": sentence, "answer": "O", "accepted": [], "evidence": sentence},
             {"type": "short", "question": "단답 문제는 무엇인가?", "answer": "정답", "accepted": ["정답"], "evidence": sentence},
@@ -222,3 +227,86 @@ def test_input_size_limits(env, monkeypatch):
     assert client.post("/api/v1/answers", json={"answers": answers}, headers=H).status_code == 400
     monkeypatch.setattr(extract, "MAX_UNZIPPED_BYTES", 1000)
     assert upload(client, [("bomb.pptx", make_pptx(SLIDES), PPTX)]).status_code == 415
+
+
+def answer(client, qid, result="correct", at="2026-11-13T10:00:00+09:00"):
+    return client.post("/api/v1/answers", json={"answers": [{"questionId": qid, "result": result, "answeredAt": at}]}, headers=H)
+
+
+def test_refill_keeps_fresh_questions(env, monkeypatch):
+    client, worker, ai = env
+    from app import main
+    monkeypatch.setattr(main, "FRESH_TARGET", 4)
+    material_id = upload(client, [("a.pptx", make_pptx(SLIDES), PPTX)]).json()["materials"][0]["id"]
+    drain(worker)
+    qs = client.get("/api/v1/questions", headers=H).json()["questions"]
+    before = len(qs)
+    calls_before = len(ai.calls)
+
+    # 안 푼 문제가 목표보다 적어지면 채움. 같은 기록을 다시 보내도 한 번만 셈
+    assert answer(client, qs[0]["id"]).json() == {"recorded": 1}
+    assert answer(client, qs[0]["id"]).json() == {"recorded": 0}
+    assert answer(client, qs[1]["id"]).json() == {"recorded": 1}
+    # 예약된 채우기가 끝나기 전에는 더 예약하지 않음
+    assert client.app.state.db.conn.execute("SELECT COUNT(*) FROM refills").fetchone()[0] == 1
+    drain(worker)
+    assert len(ai.calls) == calls_before + 1
+    # 이미 낸 문제는 프롬프트용 avoid로 넘어감
+    sent = ai.calls[-1][1]
+    assert sent["avoid"] and all(isinstance(a, str) for a in sent["avoid"])
+    assert len(client.get("/api/v1/questions", headers=H).json()["questions"]) > before
+    # 새로 받으러 올 때는 since 이후 문제만 내려감
+    assert client.get("/api/v1/materials", headers=H).json()["materials"][0]["status"] == "ready"
+
+    # 자료를 지우면 채우기 기록도 지워짐
+    client.delete(f"/api/v1/materials/{material_id}", headers=H)
+    assert client.app.state.db.conn.execute("SELECT COUNT(*) FROM refills").fetchone()[0] == 0
+
+
+def test_refill_not_scheduled_when_enough_fresh_or_capped(env, monkeypatch):
+    client, worker, ai = env
+    from app import main
+    upload(client, [("a.pptx", make_pptx(SLIDES), PPTX)])
+    drain(worker)
+    qs = client.get("/api/v1/questions", headers=H).json()["questions"]
+
+    monkeypatch.setattr(main, "FRESH_TARGET", 1)
+    answer(client, qs[0]["id"])
+    assert client.app.state.db.conn.execute("SELECT COUNT(*) FROM refills").fetchone()[0] == 0
+
+    monkeypatch.setattr(main, "FRESH_TARGET", 100)
+    monkeypatch.setattr(main, "MAX_REFILLS_PER_MATERIAL", 1)
+    answer(client, qs[1]["id"])
+    drain(worker)
+    answer(client, qs[2]["id"])
+    assert client.app.state.db.conn.execute("SELECT COUNT(*) FROM refills").fetchone()[0] == 1
+
+
+def test_refill_failure_does_not_break_material(env, monkeypatch):
+    client, worker, ai = env
+    from app import main
+    monkeypatch.setattr(main, "FRESH_TARGET", 100)
+    upload(client, [("a.pptx", make_pptx(SLIDES), PPTX)])
+    drain(worker)
+    qs = client.get("/api/v1/questions", headers=H).json()["questions"]
+    answer(client, qs[0]["id"])
+    ai.fail = True
+    drain(worker)
+    status = client.app.state.db.conn.execute("SELECT status, attempts FROM refills").fetchone()
+    assert status["status"] == "failed" and status["attempts"] == 3
+    assert client.get("/api/v1/materials", headers=H).json()["materials"][0]["status"] == "ready"
+
+
+def test_drop_duplicates_same_fact_or_similar_wording():
+    from app.worker import drop_duplicates
+    ev = "운전면허 학과시험은 40문항이며 합격 기준은 1종 70점, 2종 60점이다."
+    existing = [{"type": "short", "question": "운전면허 학과시험의 문항 수는 무엇인가?", "answer": "40문항", "evidence": ev}]
+    new = [
+        {"type": "short", "question": "운전면허 학과시험은 몇 문항인가?", "answer": "40 문항", "evidence": ev},
+        {"type": "short", "question": "운전면허 학과시험의 문항 수는 무엇인가요?", "answer": "사십", "evidence": "다른 문장"},
+        {"type": "short", "question": "2종 학과시험의 합격 기준은 몇 점인가?", "answer": "60점", "evidence": ev},
+        {"type": "ox", "question": "운전면허 학과시험은 40문항이다", "answer": "O", "evidence": ev},
+        {"type": "ox", "question": "운전면허 학과시험은 40문항이다", "answer": "O", "evidence": ev},
+    ]
+    kept = drop_duplicates(new, existing)
+    assert [q["question"] for q in kept] == ["2종 학과시험의 합격 기준은 몇 점인가?", "운전면허 학과시험은 40문항이다"]
