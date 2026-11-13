@@ -53,6 +53,13 @@ curl https://scrollmate-be.fly.dev/api/v1/health
 | 기기별 동시 처리 자료 | 5개 | `429 too_many_materials` |
 | 기기별 하루 업로드 | 10개 | `429 rate_limited` |
 | 전체 대기 조각 | 900개 | `429 rate_limited` |
+| IP별 하루 업로드 (`Fly-Client-IP`, 배포 환경만) | 30개 (`BE_IP_DAILY_UPLOADS`) | `429 rate_limited` |
+| 서버 전체 하루 생성 조각 | 2000개 (`BE_DAILY_CHUNKS`) | `429 rate_limited` |
+| 요청 본문 | 101MB | `413 file_too_large` |
+| PPTX 압축 해제 크기 | 200MB | `415 unsupported_file` |
+| `X-Device-Id` 길이, 풀이 기록 한 번에 | 64자, 200개 | `400 invalid_request` |
+
+로그인이 없어 기기 ID를 바꾸면 기기별 한도를 피할 수 있음. IP와 서버 전체 한도는 OpenAI 비용을 묶기 위함. 서버 전체 한도 2000조각은 평가 기준 약 $4. API 문서 화면(`/docs`)은 끔
 
 ## 아직 없는 것
 

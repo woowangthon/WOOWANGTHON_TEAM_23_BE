@@ -1,14 +1,21 @@
 import difflib
 import re
+import zipfile
 from io import BytesIO
 
 from pptx import Presentation
 from pypdf import PdfReader
 
 CHUNK_CHARS = 2000
+# PPTX는 zip이라 압축을 풀면 크기가 크게 늘 수 있음. 여는 것만으로 메모리가 넘치지 않게 막음
+MAX_UNZIPPED_BYTES = 200 * 1024 * 1024
 
 
 class UnsupportedFile(Exception):
+    pass
+
+
+class TooManyPages(Exception):
     pass
 
 
@@ -21,13 +28,22 @@ def kind_of(name: str, content_type: str | None) -> str:
     raise UnsupportedFile(name)
 
 
-def extract_pages(kind: str, data: bytes) -> list[str]:
-    """쪽(슬라이드)마다 글자를 뽑음. 번호는 목록 순서 + 1"""
+def extract_pages(kind: str, data: bytes, max_pages: int) -> list[str]:
+    """쪽(슬라이드)마다 글자를 뽑음. 번호는 목록 순서 + 1. 글자를 뽑기 전에 쪽수와 압축 해제 크기를 먼저 확인함"""
     try:
         if kind == "pdf":
-            return [(page.extract_text() or "").strip() for page in PdfReader(BytesIO(data)).pages]
+            pages = PdfReader(BytesIO(data)).pages
+            if len(pages) > max_pages:
+                raise TooManyPages(len(pages))
+            return [(page.extract_text() or "").strip() for page in pages]
+        with zipfile.ZipFile(BytesIO(data)) as z:
+            if sum(i.file_size for i in z.infolist()) > MAX_UNZIPPED_BYTES:
+                raise UnsupportedFile("압축 해제 크기 초과")
+        prs = Presentation(BytesIO(data))
+        if len(prs.slides) > max_pages:
+            raise TooManyPages(len(prs.slides))
         slides = []
-        for slide in Presentation(BytesIO(data)).slides:
+        for slide in prs.slides:
             texts = []
             for shape in slide.shapes:
                 if shape.has_text_frame:
@@ -36,6 +52,8 @@ def extract_pages(kind: str, data: bytes) -> list[str]:
                     texts += [cell.text for row in shape.table.rows for cell in row.cells]
             slides.append("\n".join(t.strip() for t in texts if t.strip()))
         return slides
+    except (TooManyPages, UnsupportedFile):
+        raise
     except Exception as e:
         raise UnsupportedFile(str(e)) from e
 
