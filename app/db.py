@@ -29,6 +29,13 @@ CREATE TABLE IF NOT EXISTS refills (
     material_id TEXT NOT NULL, chunk_idx INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
     attempts INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS usage_days (
+    device_id TEXT NOT NULL, day TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (device_id, day)
+);
+CREATE TABLE IF NOT EXISTS advice (
+    device_id TEXT NOT NULL, day TEXT NOT NULL, based_on TEXT NOT NULL, facts TEXT NOT NULL, message TEXT NOT NULL,
+    PRIMARY KEY (device_id, day)
+);
 CREATE TABLE IF NOT EXISTS usage_counts (
     device_id TEXT NOT NULL, day TEXT NOT NULL, kind TEXT NOT NULL, count INTEGER NOT NULL,
     PRIMARY KEY (device_id, day, kind)
