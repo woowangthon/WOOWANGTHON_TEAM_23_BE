@@ -59,6 +59,8 @@ class FakeAI:
         request = worker_module.httpx.Request("POST", url)
         if self.fail:
             return worker_module.httpx.Response(502, json={"error": {"code": "llm_unavailable"}}, request=request)
+        if url.endswith("/advice"):
+            return worker_module.httpx.Response(200, json={"message": "한마디", "fallback": False}, request=request)
         text = json["text"]
         sentence = "운전면허 학과시험은 40문항이며 합격 기준은 1종 70점, 2종 60점이다." if "학과시험" in text else \
             "도로교통법은 혈중알코올농도 0.03퍼센트 이상인 상태의 운전을 금지한다."
@@ -309,3 +311,61 @@ def test_drop_duplicates_same_fact_or_similar_wording():
     ]
     kept = drop_duplicates(new, existing)
     assert [q["question"] for q in kept] == ["2종 학과시험의 합격 기준은 몇 점인가?", "운전면허 학과시험은 40문항이다"]
+
+
+def usage_day(day, **values):
+    base = {"date": day, "sessionCount": 2, "totalMinutes": 15, "swipes": 40, "cardsShown": 4, "cardsAnswered": 3,
+            "cardsSkipped": 1, "correct": 2, "lateNightShare": 0.0, "longestSessionMinutes": 9}
+    return {**base, **values}
+
+
+def test_choose_facts_rules():
+    from datetime import date
+    from app.advice import choose_facts
+    today = date(2026, 11, 14)
+    assert choose_facts([], today) is None
+    assert choose_facts([usage_day("2026-11-14", sessionCount=0)], today) is None
+    # 어제 기록이 있으면 오늘보다 어제를 씀
+    day, facts = choose_facts([usage_day("2026-11-14"), usage_day("2026-11-13", lateNightShare=0.5)], today)
+    assert day == "2026-11-13"
+    assert facts == {"기준": "어제", "쇼츠 시청(분)": 15, "밤 12시 이후 비중(%)": 50}
+    _, facts = choose_facts([usage_day("2026-11-13", longestSessionMinutes=25)], today)
+    assert facts["가장 길게 이어 본 시간(분)"] == 25
+    _, facts = choose_facts([usage_day("2026-11-13", cardsShown=4, cardsSkipped=3)], today)
+    assert facts == {"기준": "어제", "뜬 카드": 4, "건너뛴 카드": 3}
+    _, facts = choose_facts([usage_day("2026-11-10")], today)
+    assert facts == {"기준": "11월 10일", "푼 카드": 3, "맞힌 카드": 2}
+    _, facts = choose_facts([usage_day("2026-11-14", cardsShown=0, cardsAnswered=0, cardsSkipped=0)], today)
+    assert facts == {"기준": "오늘", "쇼츠 시청(분)": 15, "넘긴 횟수": 40}
+
+
+def test_usage_and_advice(env):
+    from app import main
+    client, _, ai = env
+    assert client.get("/api/v1/advice/today", headers=H).json()["message"] is None
+    yesterday = (main.datetime.now(main.KST).date() - main.timedelta(days=1)).isoformat()
+    r = client.post("/api/v1/usage/daily", json={"days": [usage_day(yesterday)]}, headers=H)
+    assert r.json() == {"recorded": 1}
+    # 같은 날을 다시 보내면 덮어씀
+    client.post("/api/v1/usage/daily", json={"days": [usage_day(yesterday, cardsAnswered=5, correct=4)]}, headers=H)
+    body = client.get("/api/v1/advice/today", headers=H).json()
+    assert body["message"] == "한마디" and body["basedOn"] == yesterday
+    assert body["facts"] == {"기준": "어제", "푼 카드": 5, "맞힌 카드": 4}
+    # 하루에 한 번만 AI를 부르고 이후에는 저장한 문장을 줌
+    client.get("/api/v1/advice/today", headers=H)
+    assert sum(url.endswith("/advice") for url, _ in ai.calls) == 1
+    # 다른 기기의 기록은 쓰지 않음
+    assert client.get("/api/v1/advice/today", headers={"X-Device-Id": "dev-2"}).json()["message"] is None
+    assert client.post("/api/v1/usage/daily", json={"days": [usage_day("2026/11/13")]}, headers=H).status_code == 400
+
+
+def test_advice_falls_back_without_saving_when_ai_fails(env):
+    from app import main
+    client, _, ai = env
+    yesterday = (main.datetime.now(main.KST).date() - main.timedelta(days=1)).isoformat()
+    client.post("/api/v1/usage/daily", json={"days": [usage_day(yesterday)]}, headers=H)
+    ai.fail = True
+    body = client.get("/api/v1/advice/today", headers=H).json()
+    assert body["fallback"] is True and "푼 카드 3" in body["message"]
+    ai.fail = False
+    assert client.get("/api/v1/advice/today", headers=H).json()["message"] == "한마디"

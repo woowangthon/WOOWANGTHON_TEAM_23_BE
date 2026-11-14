@@ -3,14 +3,16 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
+import httpx
 from fastapi import FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from app.advice import choose_facts
 from app.db import Database
 from app.extract import TooManyPages, UnsupportedFile, extract_pages, kind_of, split_chunks, squash
 from app.worker import Worker
@@ -31,6 +33,9 @@ FRESH_TARGET = 5
 MAX_REFILLS_PER_MATERIAL = 10
 MAX_BODY_BYTES = MAX_FILES * MAX_BYTES + 1024 * 1024
 MAX_DEVICE_ID = 64
+# 한 번에 받는 시청 기록 일수와, 기기마다 하루에 새로 만드는 한마디 횟수(실패 후 재시도 포함)
+MAX_USAGE_DAYS = 14
+DAILY_ADVICE = 3
 
 
 class ApiError(HTTPException):
@@ -307,6 +312,66 @@ def create_app(db_path: str | None = None, ai_url: str | None = None, run_worker
             owned_question(device_id, question_id)
             db.conn.execute("INSERT INTO reports VALUES (?, ?, ?, ?)", (device_id, question_id, body.reason, time.time()))
         return Response(status_code=204)
+
+    class UsageDay(BaseModel):
+        date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+        sessionCount: int = Field(ge=0, le=1000)
+        totalMinutes: int = Field(ge=0, le=1440)
+        swipes: int = Field(ge=0, le=100000)
+        cardsShown: int = Field(ge=0, le=10000)
+        cardsAnswered: int = Field(ge=0, le=10000)
+        cardsSkipped: int = Field(ge=0, le=10000)
+        correct: int = Field(ge=0, le=10000)
+        lateNightShare: float = Field(ge=0, le=1)
+        longestSessionMinutes: int = Field(ge=0, le=1440)
+
+    class UsageBody(BaseModel):
+        days: list[UsageDay] = Field(max_length=MAX_USAGE_DAYS)
+
+    @app.post("/api/v1/usage/daily")
+    def post_usage(body: UsageBody, x_device_id: str | None = Header(None)):
+        device_id = device(x_device_id)
+        with db.lock:
+            for d in body.days:
+                # 기기가 하루 합계를 다시 계산해 보내므로 같은 날은 덮어씀
+                db.conn.execute(
+                    "INSERT INTO usage_days VALUES (?, ?, ?) ON CONFLICT DO UPDATE SET data = excluded.data",
+                    (device_id, d.date, d.model_dump_json()),
+                )
+        return {"recorded": len(body.days)}
+
+    @app.get("/api/v1/advice/today")
+    def advice_today(x_device_id: str | None = Header(None)):
+        device_id = device(x_device_id)
+        day = today()
+        with db.lock:
+            cached = db.conn.execute("SELECT * FROM advice WHERE device_id = ? AND day = ?", (device_id, day)).fetchone()
+            if cached:
+                return {"message": cached["message"], "basedOn": cached["based_on"], "facts": json.loads(cached["facts"]), "fallback": False}
+            rows = db.conn.execute(
+                "SELECT data FROM usage_days WHERE device_id = ? AND day >= ? ORDER BY day DESC",
+                (device_id, (date.fromisoformat(day) - timedelta(days=7)).isoformat()),
+            ).fetchall()
+        chosen = choose_facts([json.loads(r["data"]) for r in rows], date.fromisoformat(day))
+        if chosen is None:
+            return {"message": None, "basedOn": None, "facts": None, "fallback": False}
+        based_on, facts = chosen
+        with db.lock:
+            use_quota(device_id, "advice", 1, DAILY_ADVICE)
+        try:
+            r = httpx.post(f"{worker.ai_url}/advice", json={"facts": facts}, timeout=30)
+            r.raise_for_status()
+            result = r.json()
+        except (httpx.HTTPError, ValueError):
+            result = {"message": ", ".join(f"{k} {v}" for k, v in facts.items()), "fallback": True}
+        # AI가 문장을 만들지 못한 경우는 저장하지 않아 다음에 다시 시도함
+        if not result.get("fallback"):
+            with db.lock:
+                db.conn.execute(
+                    "INSERT OR REPLACE INTO advice VALUES (?, ?, ?, ?, ?)",
+                    (device_id, day, based_on, json.dumps(facts, ensure_ascii=False), result["message"]),
+                )
+        return {"message": result["message"], "basedOn": based_on, "facts": facts, "fallback": bool(result.get("fallback"))}
 
     @app.get("/api/v1/health")
     def health():
