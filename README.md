@@ -71,6 +71,10 @@ curl https://scrollmate-be.fly.dev/api/v1/health
 
 ## 아직 없는 것
 
-- `POST /usage/daily`, `GET /advice/today` (시청 기록 조언)
 - 구글 로그인 (BE #5). 지금은 `X-Device-Id`로만 구분함
 - 정답 검증 호출(AI `verify`)은 생성 흐름에 넣지 않음
+
+## 만들지 않기로 한 것 (11/13)
+
+- 오답노트(`GET /review`), 시청 기록 집계와 조언(`POST /usage/daily`, `GET /advice/today`). 앱이 쓰지 않아 `GET /review`도 지움
+- 감지 대상은 안드로이드 유튜브 쇼츠만. 인스타그램 릴스는 다루지 않음
