@@ -154,7 +154,7 @@ def test_ai_failure_marks_failed_after_retries(env):
     assert len(ai.calls) == 3 * m["chunksTotal"]
 
 
-def test_delete_answers_review_grade_report(env):
+def test_delete_answers_grade_report(env):
     client, worker, _ = env
     material_id = upload(client, [("a.pptx", make_pptx(SLIDES), PPTX)]).json()["materials"][0]["id"]
     drain(worker)
@@ -168,8 +168,7 @@ def test_delete_answers_review_grade_report(env):
         {"questionId": "q_none", "result": "wrong", "answeredAt": "2026-11-08T11:00:00+09:00"},
     ]
     assert client.post("/api/v1/answers", json={"answers": answers}, headers=H).json() == {"recorded": 2}
-    item = client.get("/api/v1/review", headers=H).json()["items"][0]
-    assert item["question"]["id"] == ox["id"] and item["wrongCount"] == 2 and item["lastWrongAt"].startswith("2026-11-08T11")
+    assert client.get("/api/v1/review", headers=H).status_code == 404
 
     r = client.post(f"/api/v1/questions/{short['id']}/grade", json={"userAnswer": "정 답"}, headers=H)
     assert r.json() == {"correct": True, "by": "rule"}

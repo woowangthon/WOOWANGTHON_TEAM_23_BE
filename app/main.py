@@ -297,20 +297,6 @@ def create_app(db_path: str | None = None, ai_url: str | None = None, run_worker
             schedule_refills(device_id, touched)
         return {"recorded": recorded}
 
-    @app.get("/api/v1/review")
-    def review(x_device_id: str | None = Header(None)):
-        device_id = device(x_device_id)
-        with db.lock:
-            rows = db.conn.execute(
-                "SELECT q.*, COUNT(*) AS wrong_count, MAX(a.answered_at) AS last_wrong_at FROM answers a "
-                "JOIN questions q ON q.id = a.question_id WHERE a.device_id = ? AND a.result = 'wrong' "
-                "GROUP BY q.id ORDER BY last_wrong_at DESC",
-                (device_id,),
-            ).fetchall()
-        return {"items": [
-            {"question": question_json(r), "wrongCount": r["wrong_count"], "lastWrongAt": r["last_wrong_at"]} for r in rows
-        ]}
-
     class ReportBody(BaseModel):
         reason: str = Field(max_length=200)
 
